@@ -1,7 +1,26 @@
 import json
 from typing import Dict, Optional, Any, List
 import requests
-from config import Config
+import os
+import importlib
+
+if os.path.exists('../open-api/Demo/Python/config.py'):
+    spec = importlib.util.spec_from_file_location(
+        "custom_helpers",
+        "../open-api/Demo/Python/config.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    Config = module.Config
+else:
+    spec = importlib.util.spec_from_file_location(
+        "custom_helpers",
+        "./config.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    Config = module.Config
+
 from error_codes import ErrorCode
 from open_api_http_sign import get_auth_headers, sort_params
 import logging
@@ -75,13 +94,71 @@ class OpenApiHttpFuturePrivate:
         
         response = self.session.get(url, params=params, headers=headers)
         return self._handle_response(response)
-    
+    def change_leverage(self, symbol, leverage = 20, marginCoin = 'USDT'):
+        url = f"{self.base_url}/api/v1/futures/account/change_leverage"
+        data = {
+          "symbol": symbol,
+          "leverage": leverage,
+          "marginCoin": marginCoin
+        }
+        body = json.dumps(data)
+        headers = get_auth_headers(self.api_key, self.secret_key, body=body)
+        
+        response = self.session.post(url, json=data, headers=headers)
+        return self._handle_response(response)
+    def get_symbol_info(self, symbol: str = ""):
+        url = "https://fapi.bitunix.com/api/v1/futures/market/trading_pairs"
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        if not symbol:
+            return data.get("data", [])
+        for item in data.get("data", []):
+            if item["symbol"] == symbol:
+                return item
+        raise ValueError(f"Symbol {symbol} not found")
+
+    def precision_from_ticksize(self, tick_size: str) -> int:
+        # e.g. tick_size = "0.0001"
+        if '.' not in tick_size:
+            return 0
+        decimals = tick_size.rstrip('0').split('.')[-1]
+        return len(decimals)
+    def get_price_precision(self, symbol):
+        return self.precision_from_ticksize(self.get_symbol_info(symbol)['tickSize'])
+    def get_symbol_detail(self):
+        url = "https://fapi.bitunix.com/api/v1/futures/market/trading_pairs"
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json().get("data", [])
+    def get_precision(self, symbol: str):
+        data = self.get_symbol_info()
+        for item in data:
+            if item["symbol"] == symbol:
+                return int(item["basePrecision"]), int(item["quotePrecision"])
+
+        raise ValueError(f"Symbol {symbol} not found")
+    def adjust_to_precision(self, value: float, precision: int) -> float:
+        """
+        Rounds the value down to the allowed precision.
+        
+        Args:
+            value (float): The value to adjust (quantity or price).
+            precision (int): Number of decimal places allowed.
+
+        Returns:
+            float: Value rounded down (truncated) to the given precision.
+        """
+        factor = 10 ** precision
+        return int(value * factor) / factor
     def place_order(self, symbol: str, side: str, order_type: str, qty: str, 
                    price: Optional[str] = None, position_id: Optional[str] = None,
                    trade_side: str = "OPEN", effect: str = "GTC", reduce_only: bool = False,
                    client_id: Optional[str] = None, tp_price: Optional[str] = None,
                    tp_stop_type: Optional[str] = None, tp_order_type: Optional[str] = None,
-                   tp_order_price: Optional[str] = None) -> Dict[str, Any]:
+                   tp_order_price: Optional[str] = None, sl_price: Optional[str] = None,
+                   sl_stop_type: Optional[str] = None, sl_order_type: Optional[str] = None,
+                   sl_order_price: Optional[str] = None) -> Dict[str, Any]:
         """
         Place order
         
@@ -104,8 +181,11 @@ class OpenApiHttpFuturePrivate:
         Returns:
             Dict[str, Any]: Order information
         """
+        quantityPrecision, pricePrecision = self.get_precision(symbol)
+        qty = self.adjust_to_precision(float(qty), quantityPrecision)
+        tp_price = (self.adjust_to_precision(float(tp_price), pricePrecision) if pricePrecision > 0 else tp_price) if tp_price else tp_price
+        sl_price = self.adjust_to_precision(float(sl_price), pricePrecision) if pricePrecision > 0 else sl_price
         url = f"{self.base_url}/api/v1/futures/trade/place_order"
-        
         data = {
             "symbol": symbol,
             "side": side,
@@ -130,6 +210,15 @@ class OpenApiHttpFuturePrivate:
             data["tpOrderType"] = tp_order_type
         if tp_order_price is not None:
             data["tpOrderPrice"] = tp_order_price
+        if sl_price is not None:
+            data["slPrice"] = sl_price
+        if sl_stop_type is not None:
+            data["slStopType"] = sl_stop_type
+        if sl_order_type is not None:
+            data["slOrderType"] = sl_order_type
+        if sl_order_price is not None:
+            data["slOrderPrice"] = sl_order_price
+
             
         body = json.dumps(data)
         headers = get_auth_headers(self.api_key, self.secret_key, body=body)
@@ -202,7 +291,38 @@ class OpenApiHttpFuturePrivate:
         
         response = self.session.get(url, params=params, headers=headers)
         return self._handle_response(response)
-
+    def get_pending_positions(self, symbol: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get historical position information
+        
+        Args:
+            symbol: Trading pair, if not provided, get all positions
+            
+        Returns:
+            Dict[str, Any]: Historical position information
+        """
+        url = f"{self.base_url}/api/v1/futures/position/get_pending_positions"
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+            
+        query_string = sort_params(params)
+        headers = get_auth_headers(self.api_key, self.secret_key, query_string)
+        
+        response = self.session.get(url, params=params, headers=headers)
+        return self._handle_response(response)
+    def has_prending_positions(self, symbol):
+        return any(self.get_pending_positions(symbol))
+    def get_current_price(self, symbol):
+        url = "https://fapi.bitunix.com/api/v1/futures/market/funding_rate"
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+            
+        query_string = sort_params(params)
+        headers = get_auth_headers(self.api_key, self.secret_key, query_string)
+        response = self.session.get(url, params=params, headers=headers)
+        return float(self._handle_response(response).get("markPrice", -1))
 async def main():
     """Main function example"""
     # Load configuration
@@ -215,15 +335,7 @@ async def main():
         # Get account information
         account = client.get_account()
         logging.info(f"Account info: {account}")
-        
-        # Get historical position information
-        history_positions = client.get_history_positions("BTCUSDT")
-        logging.info(f"History positions: {history_positions}")
-        
-        # Get historical orders
-        history_orders = client.get_history_orders("BTCUSDT")
-        logging.info(f"History orders: {history_orders}")
-
+        logging.info(f"Account info: {client.get_current_price('BTCUSDT')}")
         """
         WARNING!!! This is example code for placing and canceling orders. If you are using a real account,
         please be cautious when uncommenting for testing, as any financial losses will be your responsibility.
